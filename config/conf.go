@@ -7,7 +7,6 @@ import (
 	"gopkg.in/yaml.v3"
 	"log"
 	"os"
-	"reflect"
 	"sync"
 	"time"
 )
@@ -18,7 +17,7 @@ var (
 	QiniuConfig QiniuConf
 	SSLConfig   SSLConf
 	mu          sync.Mutex // 保护写操作的互斥锁
-	initialized bool       // 用来标识是否为初次启动
+	Changed     bool
 )
 
 type EmailConf struct {
@@ -28,13 +27,11 @@ type EmailConf struct {
 	Receiver string `yaml:"receiver"`
 	SmtpPort string `yaml:"smtpPort"`
 	SmtpHost string `yaml:"smtpHost"`
-	Changed  bool   // 记录是否发生变更
 }
 
 type QiniuConf struct {
 	AccessKey string `yaml:"accessKey"`
 	SecretKey string `yaml:"secretKey"`
-	Changed   bool   // 记录是否发生变更
 }
 
 type SSLConf struct {
@@ -45,8 +42,7 @@ type SSLConf struct {
 		AccessKeyID     string `yaml:"accessKeyID"`
 		AccessKeySecret string `yaml:"accessKeySecret"`
 	} `yaml:"aliyun"`
-	DB      string `yaml:"db"`
-	Changed bool   // 记录是否发生变更
+	DB string `yaml:"db"`
 }
 
 type CronConf struct {
@@ -77,81 +73,42 @@ func InitViper(path string) {
 	})
 }
 
-// CheckAndUpdate 统一检查配置变更，排除 Changed 字段的影响
-func CheckAndUpdate(oldValue, newValue interface{}, changed *bool) {
-	// 使用 reflect 包来比较两个结构体的值是否不同，排除 Changed 字段
-	if !reflect.DeepEqual(removeChangedField(oldValue), removeChangedField(newValue)) {
-		*changed = true
-		reflect.ValueOf(oldValue).Elem().Set(reflect.ValueOf(newValue))
-	} else {
-		*changed = false
-	}
-}
-
-// removeChangedField 从结构体中移除 Changed 字段，以避免其影响
-func removeChangedField(value interface{}) interface{} {
-	val := reflect.ValueOf(value).Elem()
-	if val.Kind() != reflect.Struct {
-		return value
-	}
-
-	// 遍历结构体字段，忽略 Changed 字段
-	for i := 0; i < val.NumField(); i++ {
-		field := val.Field(i)
-		if val.Type().Field(i).Name == "Changed" {
-			// 将 Changed 字段的值置为零值，避免其影响比较
-			field.Set(reflect.Zero(field.Type()))
-		}
-	}
-
-	return value
-}
-
 // ReloadConfig 重新加载配置到结构体
 func ReloadConfig() {
 	mu.Lock()
 	defer mu.Unlock()
 
-	var newEmailConf EmailConf
-	var newQiniuConf QiniuConf
-	var newSSLConf SSLConf
-
-	if err := viper.UnmarshalKey("email", &newEmailConf); err != nil {
+	if err := viper.UnmarshalKey("emailconf", &EmailConfig); err != nil {
 		log.Println("解析 Email 配置失败:", err)
 		return
 	}
 
-	if err := viper.UnmarshalKey("qiniu", &newQiniuConf); err != nil {
+	if err := viper.UnmarshalKey("qiniuconf", &QiniuConfig); err != nil {
 		log.Println("解析 Qiniu 配置失败:", err)
 		return
 	}
 
-	if err := viper.UnmarshalKey("ssl", &newSSLConf); err != nil {
+	if err := viper.UnmarshalKey("sslconf", &SSLConfig); err != nil {
 		log.Println("解析 SSL 配置失败:", err)
 		return
 	}
 
-	// 如果是初次启动，则直接赋值并初始化 Changed 为 false
-	if !initialized {
-		EmailConfig = newEmailConf
-		EmailConfig.Changed = true
-		QiniuConfig = newQiniuConf
-		QiniuConfig.Changed = true
-		SSLConfig = newSSLConf
-		SSLConfig.Changed = true
-		initialized = true
-	} else {
-		// 检查变更
-		CheckAndUpdate(&EmailConfig, newEmailConf, &EmailConfig.Changed)
-		CheckAndUpdate(&QiniuConfig, newQiniuConf, &QiniuConfig.Changed)
-		CheckAndUpdate(&SSLConfig, newSSLConf, &SSLConfig.Changed)
-	}
+	SetChangeStatus(true)
+
 }
 
 // WriteConfigToFile 将配置写入 YAML 文件
-func WriteConfigToFile(cronConf *CronConf) error {
+func WriteConfigToFile(yamlData string) error {
 	mu.Lock()
 	defer mu.Unlock()
+
+	var cronConf CronConf
+	decoder := yaml.NewDecoder(bytes.NewReader([]byte(yamlData)))
+	err := decoder.Decode(&cronConf)
+	if err != nil {
+		log.Println("解析 YAML 失败:", err)
+		return err
+	}
 
 	// 将 CronConf 结构体转换为 YAML
 	data, err := yaml.Marshal(cronConf)
@@ -177,34 +134,12 @@ func WriteConfigToFile(cronConf *CronConf) error {
 		return err
 	}
 
-	// 重新加载全局配置变量
-	ReloadConfig()
-
-	log.Println("配置文件更新成功！")
 	return nil
-}
-
-// LoadConfigFromYAML 解析 YAML 字符串到结构体
-func LoadConfigFromYAML(yamlData string) (*CronConf, error) {
-	var newConfig CronConf
-
-	decoder := yaml.NewDecoder(bytes.NewReader([]byte(yamlData)))
-	err := decoder.Decode(&newConfig)
-	if err != nil {
-		log.Println("解析 YAML 失败:", err)
-		return nil, err
-	}
-
-	return &newConfig, nil
 }
 
 // GetAllConfigsAsYAML 获取所有配置并转换为 YAML 字符串
 func GetAllConfigsAsYAML() (string, error) {
-	mu.Lock()
-	defer mu.Unlock()
-
 	config := GetCronConfig()
-
 	// 序列化成 YAML 格式
 	data, err := yaml.Marshal(config)
 	if err != nil {
@@ -224,4 +159,12 @@ func GetCronConfig() *CronConf {
 		QiniuConf: QiniuConfig,
 		SSLConf:   SSLConfig,
 	}
+}
+
+func SetChangeStatus(changed bool) {
+	Changed = changed
+}
+
+func CheckIfStatus() bool {
+	return Changed
 }

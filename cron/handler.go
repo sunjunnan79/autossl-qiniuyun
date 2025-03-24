@@ -149,7 +149,7 @@ func (h *UploadCertHandler) Handle(ctx context.Context, domain *DomainWithCert) 
 	return h.HandleNext(ctx, domain)
 }
 
-// 6. 强制开启 HTTPS并将成功的部分存到本地,失败的保留
+// 5. 强制开启 HTTPS并将成功的部分存到本地,失败的保留
 type ForceHTTPSHandler struct {
 	BaseHandler
 }
@@ -183,7 +183,7 @@ func (h *ForceHTTPSHandler) Handle(ctx context.Context, domain *DomainWithCert) 
 		}
 	case gorm.ErrRecordNotFound:
 		// 如果查不到证书，创建新证书
-		err := sslDAO.CreateSSL(domain.CertId, domain.CertId, domain.KeyPEM, domain.Domains)
+		err := sslDAO.CreateSSL(domain.FatherDomain, domain.CertId, domain.CertPEM, domain.KeyPEM, domain.Domains)
 		if err != nil {
 			return ForceHTTPSErrCode, err
 		}
@@ -278,17 +278,4 @@ func checkIfPass(t int64) bool {
 	return now-t < ExpirationThreshold*SecondsPerDay
 }
 
-//	TODO 3.14计划
-//	1. 完成上传功能的重构
-//  2. 完成热更新功能的接口,目前打算直接提供一个GET和一个PUT接口实现最轻量化的更新
-
-//  TODO 3.15计划
-//  1. 完成所有开发任务
-//  2. 在生产环境进行测试
-//  3. 编写README文档
-
-// TODO 后续迭代计划
-// 先看看有没有需求吧
-// 可以作为自己的一个重要开源项目和进入devops领域的一个跳板
-// 支持更多平台?
-// 支持可视化?
+// TODO 责任链是个很失败的方案,让整个代码变得异常难读,事件驱动可能会是个更好的方案

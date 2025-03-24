@@ -27,8 +27,8 @@ func NewSSLDao(path string) (*SSLDao, error) {
 }
 
 // CreateSSL 创建 SSL 证书记录
-func (dao *SSLDao) CreateSSL(certID, certPEM, keyPEM string, domains []string) error {
-	ssl := SSL{CertID: certID, CertPEM: certPEM, KeyPEM: keyPEM}
+func (dao *SSLDao) CreateSSL(domainName, certID, certPEM, keyPEM string, domains []string) error {
+	ssl := SSL{DomainName: domainName, CertID: certID, CertPEM: certPEM, KeyPEM: keyPEM}
 	// 将域名转换为 Domain 结构体
 	for _, domain := range domains {
 		ssl.Domains = append(ssl.Domains, Domain{Name: domain})
@@ -130,18 +130,18 @@ func (dao *SSLDao) UpdateSSL(certID string, newDomains []string) error {
 	return nil
 }
 
-// DeleteSSL 删除 SSL 证书及关联域名
+// DeleteSSL 硬删除 SSL 证书及关联域名
 func (dao *SSLDao) DeleteSSL(certID string) error {
 	var ssl SSL
-	if err := dao.db.Where("cert_id = ?", certID).First(&ssl).Error; err != nil {
+	if err := dao.db.Unscoped().Where("cert_id = ?", certID).First(&ssl).Error; err != nil {
 		return err
 	}
 
-	// 删除关联的域名
-	if err := dao.db.Where("ssl_id = ?", ssl.ID).Delete(&Domain{}).Error; err != nil {
+	// 直接硬删除关联的域名
+	if err := dao.db.Unscoped().Where("ssl_id = ?", ssl.ID).Delete(&Domain{}).Error; err != nil {
 		return err
 	}
 
-	// 删除 SSL 记录
-	return dao.db.Delete(&ssl).Error
+	// 直接硬删除 SSL 记录
+	return dao.db.Unscoped().Delete(&ssl).Error
 }

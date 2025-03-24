@@ -65,7 +65,7 @@ type ForceHTTPSReq struct {
 }
 
 type UPSSLCertResp struct {
-	CertID string `json:"certID"`
+	CertID string `json:"certid"`
 }
 
 //内部通用函数
