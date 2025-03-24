@@ -9,6 +9,7 @@ import (
 	"github.com/muxi-Infra/autossl-qiniuyun/pkg/ssl"
 	"golang.org/x/net/publicsuffix"
 	"gorm.io/gorm"
+	"log"
 	"time"
 )
 
@@ -20,63 +21,65 @@ func NewQiniuSSL() *QiniuSSL {
 }
 
 func (q *QiniuSSL) Start() {
-	//首次启动进行的操作
+	go func() {
+		//首次启动进行的操作
+		//强制为所有的域名申请证书
+		for {
 
-	//强制为所有的域名申请证书
-	for {
+			//初始化配置
+			q.initConfig()
 
-		//初始化配置
-		q.initConfig()
-
-		//按照父域名对域名进行分组
-		domainGroups, err := q.getDomainGroups()
-		if err != nil {
-			//发送邮件
-			err := emailClient.SendEmail([]string{receiver}, "七牛云自动报警服务", fmt.Sprintf("域名列表分组失败!:%s", err.Error()), "", nil)
+			//按照父域名对域名进行分组
+			domainGroups, err := q.getDomainGroups()
 			if err != nil {
-				return
+				//发送邮件
+				err := emailClient.SendEmail([]string{receiver}, "七牛云自动报警服务", fmt.Sprintf("域名列表分组失败!:%s", err.Error()), "", nil)
+				if err != nil {
+					return
+				}
+				continue
 			}
-			continue
+
+			//存储到失败的map里面
+			var failMap = make(map[int]*DomainWithCert)
+			for k, v := range domainGroups {
+				var d = DomainWithCert{
+					Domains:      v,
+					FatherDomain: k,
+				}
+				code, err := StartStrategy(StartAll, &d)
+				if err != nil {
+					failMap[code] = &d
+				}
+			}
+
+			var errs []ErrWithDomain
+
+			//遍历failMap
+			for k, v := range failMap {
+				_, err := StartStrategy(k, v)
+				if err != nil {
+					errs = append(errs, ErrWithDomain{
+						err:     err,
+						Domains: v.Domains,
+					})
+				}
+
+			}
+
+			//如果有错误则收集并发送最终报文
+
+			if len(errs) > 0 {
+				//发送邮件
+				err := emailClient.SendEmail([]string{receiver}, "七牛云自动报警服务", "", q.generateErrorReportHTML(errs), nil)
+				if err != nil {
+					// TODO 如果邮件也失败了的话应当输出到日志系统里
+				}
+			}
+
 		}
+	}()
 
-		//存储到失败的map里面
-		var failMap = make(map[int]*DomainWithCert)
-		for k, v := range domainGroups {
-			var d = DomainWithCert{
-				Domains:      v,
-				FatherDomain: k,
-			}
-			code, err := StartStrategy(StartAll, &d)
-			if err != nil {
-				failMap[code] = &d
-			}
-		}
-
-		var errs []ErrWithDomain
-
-		//遍历failMap
-		for k, v := range failMap {
-			_, err := StartStrategy(k, v)
-			if err != nil {
-				errs = append(errs, ErrWithDomain{
-					err:     err,
-					Domains: v.Domains,
-				})
-			}
-
-		}
-
-		//如果有错误则收集并发送最终报文
-
-		if len(errs) > 0 {
-			//发送邮件
-			err := emailClient.SendEmail([]string{receiver}, "七牛云自动报警服务", "", q.generateErrorReportHTML(errs), nil)
-			if err != nil {
-				// TODO 如果邮件也失败了的话应当输出到日志系统里
-			}
-		}
-
-	}
 }
 
 func (q *QiniuSSL) initConfig() {
@@ -86,21 +89,15 @@ func (q *QiniuSSL) initConfig() {
 
 	//停止一段时间防止被识别为攻击
 	time.Sleep(cron.Duration)
-
-	//当出现更改时才进行修改
-	if cron.QiniuConf.Changed {
+	if config.CheckIfStatus() {
 		qiniuClient = qiniu.NewQiniuClient(cron.AccessKey, cron.SecretKey)
-	}
 
-	if cron.EmailConf.Changed {
 		emailClient = email.NewEmailClient(cron.UserName, cron.Password, cron.Sender, cron.SmtpHost, cron.SmtpPort)
-	}
 
-	if cron.SSLConf.Changed {
 		var err error
 		sslDAO, err = dao.NewSSLDao(cron.DB)
 		if err != nil {
-			// TODO
+			log.Fatal("数据库配置失败!")
 			return
 		}
 
@@ -108,17 +105,21 @@ func (q *QiniuSSL) initConfig() {
 
 		cmClient, err = ssl.NewCertMagicClient(cron.Email, cron.SSLPath, provider)
 		if err != nil {
-			// TODO
+			log.Fatal("certMagic配置失败!")
 			return
 		}
+
 		receiver = cron.Receiver
+		config.SetChangeStatus(false)
+
 	}
+
 	now = time.Now().Unix()
 
 }
 
 const (
-	ExpirationThreshold = 30 // 证书过期阈值（天）
+	ExpirationThreshold = 25 // 证书过期阈值（天）,因为certMagic好像是剩余30天及以上才能续约
 	SecondsPerDay       = 24 * 60 * 60
 )
 

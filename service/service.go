@@ -19,9 +19,5 @@ func (s *Service) GetAllConfigsAsYAML() (string, error) {
 
 // OverwriteConfigsFromYAML 覆盖配置（接收 YAML 字符串）
 func (s *Service) OverwriteConfigsFromYAML(yamlData string) error {
-	newConfig, err := config.LoadConfigFromYAML(yamlData)
-	if err != nil {
-		return err
-	}
-	return config.WriteConfigToFile(newConfig)
+	return config.WriteConfigToFile(yamlData)
 }
