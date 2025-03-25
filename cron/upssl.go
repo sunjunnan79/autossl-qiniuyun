@@ -7,9 +7,9 @@ import (
 	"github.com/muxi-Infra/autossl-qiniuyun/pkg/email"
 	"github.com/muxi-Infra/autossl-qiniuyun/pkg/qiniu"
 	"github.com/muxi-Infra/autossl-qiniuyun/pkg/ssl"
-	"golang.org/x/net/publicsuffix"
 	"gorm.io/gorm"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -88,7 +88,7 @@ func (q *QiniuSSL) initConfig() {
 	cron := config.GetCronConfig()
 
 	//停止一段时间防止被识别为攻击
-	time.Sleep(cron.Duration)
+	//time.Sleep(cron.Duration)
 	if config.CheckIfStatus() {
 		qiniuClient = qiniu.NewQiniuClient(cron.AccessKey, cron.SecretKey)
 
@@ -179,9 +179,22 @@ func filterUnstoredDomains(allDomains, storedDomains []string) []string {
 	return result
 }
 
-// getParentDomain 获取父级域名
 func getParentDomain(domain string) (string, error) {
-	return publicsuffix.EffectiveTLDPlusOne(domain)
+
+	//如果是以.开头的话直接返回,表示是为了某个泛用域名做申请
+	if strings.HasPrefix(domain, ".") {
+		return strings.TrimPrefix(domain, "."), nil
+	}
+
+	// 拆分域名
+	parts := strings.Split(domain, ".")
+	// 如果域名部分少于两段，说明已经是顶级域名了
+	if len(parts) < 2 {
+		return "", fmt.Errorf("no parent domain for %s", domain)
+	}
+
+	// 组合剩余部分返回
+	return strings.Join(parts[1:], "."), nil
 }
 
 // 生成错误报告的html
