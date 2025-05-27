@@ -78,17 +78,17 @@ func ReloadConfig() {
 	mu.Lock()
 	defer mu.Unlock()
 
-	if err := viper.UnmarshalKey("emailconf", &EmailConfig); err != nil {
+	if err := viper.UnmarshalKey("email", &EmailConfig); err != nil {
 		log.Println("解析 Email 配置失败:", err)
 		return
 	}
 
-	if err := viper.UnmarshalKey("qiniuconf", &QiniuConfig); err != nil {
+	if err := viper.UnmarshalKey("qiniu", &QiniuConfig); err != nil {
 		log.Println("解析 Qiniu 配置失败:", err)
 		return
 	}
 
-	if err := viper.UnmarshalKey("sslconf", &SSLConfig); err != nil {
+	if err := viper.UnmarshalKey("ssl", &SSLConfig); err != nil {
 		log.Println("解析 SSL 配置失败:", err)
 		return
 	}
