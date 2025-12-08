@@ -1,6 +1,7 @@
 package cron
 
 import (
+	"context"
 	"fmt"
 	"github.com/muxi-Infra/autossl-qiniuyun/config"
 	"github.com/muxi-Infra/autossl-qiniuyun/dao"
@@ -13,117 +14,212 @@ import (
 	"time"
 )
 
+const (
+	ExpirationThreshold = 20 // 证书过期阈值（天）,因为certMagic好像是剩余30天及以上才能续约
+	SecondsPerDay       = 24 * 60 * 60
+)
+
 type QiniuSSL struct {
+	qiniuClient *qiniu.QiniuClient
+	sslDAO      *dao.SSLDao
+	cmClient    *ssl.CertMagicClient
+	emailClient *email.EmailClient
+	receiver    string
+	duration    time.Duration
 }
 
-func NewQiniuSSL() *QiniuSSL {
-	return &QiniuSSL{}
+func NewQiniuSSL() (*QiniuSSL, error) {
+	//获取所有相关配置
+	conf, err := config.GetConfig()
+	if err != nil {
+		return nil, err
+	}
+	qiniuClient := qiniu.NewQiniuClient(
+		conf.Qiniu.AccessKey,
+		conf.Qiniu.SecretKey,
+	)
+
+	emailClient := email.NewEmailClient(
+		conf.Email.UserName,
+		conf.Email.Password,
+		conf.Email.Sender,
+		conf.Email.SmtpHost,
+		conf.Email.SmtpPort,
+	)
+
+	sslDAO, err := dao.NewSSLDao(conf.SSL.DB)
+	if err != nil {
+		return nil, err
+	}
+
+	provider := ssl.NewProvider(
+		ssl.Aliyun,
+		conf.SSL.Aliyun.AccessKeyID,
+		conf.SSL.Aliyun.AccessKeySecret,
+		"",
+	)
+
+	cmClient, err := ssl.NewCertMagicClient(conf.SSL.Email, conf.SSL.SSLPath, provider)
+	if err != nil {
+		return nil, err
+	}
+
+	return &QiniuSSL{
+		qiniuClient: qiniuClient,
+		emailClient: emailClient,
+		sslDAO:      sslDAO,
+		cmClient:    cmClient,
+		receiver:    conf.Email.Receiver,
+		duration:    conf.SSL.Duration,
+	}, nil
 }
 
 func (q *QiniuSSL) Start() {
-
-	//首次启动进行的操作
-	//强制为所有的域名申请证书
-	for {
-		//初始化配置
-		q.initConfig()
-
+	run := func() error {
 		//按照父域名对域名进行分组
 		domainGroups, err := q.getDomainGroups()
 		if err != nil {
 			//发送邮件
-			err := emailClient.SendEmail([]string{receiver}, "七牛云自动报警服务", fmt.Sprintf("域名列表分组失败!:%s", err.Error()), "", nil)
+			err := q.emailClient.SendEmail([]string{q.receiver}, "七牛云自动报警服务", fmt.Sprintf("域名列表分组失败!:%s", err.Error()), "", nil)
 			if err != nil {
-				return
-			}
-			continue
-		}
-		//存储到失败的map里面
-		var failMap = make(map[int]*DomainWithCert)
-		for k, v := range domainGroups {
-			var d = DomainWithCert{
-				Domains:      v,
-				FatherDomain: k,
-			}
-			code, err := StartStrategy(StartAll, &d)
-			if err != nil {
-				failMap[code] = &d
+				log.Println(err)
+				return err
 			}
 		}
 
-		var errs []ErrWithDomain
-
-		//遍历failMap
-		for k, v := range failMap {
-			_, err := StartStrategy(k, v)
+		for domain, list := range domainGroups {
+			err := q.StartStrategy(context.Background(), domain, list)
 			if err != nil {
-				errs = append(errs, ErrWithDomain{
-					err:     err,
-					Domains: v.Domains,
-				})
-			}
-
-		}
-
-		//如果有错误则收集并发送最终报文
-
-		if len(errs) > 0 {
-			//发送邮件
-			err := emailClient.SendEmail([]string{receiver}, "七牛云自动报警服务", "", q.generateErrorReportHTML(errs), nil)
-			if err != nil {
-				// TODO 如果邮件也失败了的话应当输出到日志系统里
+				// 发送邮件
+				err := q.emailClient.SendEmail([]string{q.receiver}, "七牛云自动报警服务", fmt.Sprintf("启动证书失败:%s", err.Error()), "", nil)
+				if err != nil {
+					log.Println(err)
+				}
+				continue
 			}
 		}
+		return nil
+	}
 
+	//首次启动进行的操作
+	//强制为所有的域名申请证书
+	for {
+
+		if err := run(); err != nil {
+			log.Println(err)
+		}
+
+		// 停五分钟等待
+		time.Sleep(5 * time.Minute)
 	}
 
 }
 
-func (q *QiniuSSL) initConfig() {
+func (q *QiniuSSL) StartStrategy(ctx context.Context, fatherDomain string, domains []string) error {
+	var (
+		now = time.Now()
+	)
 
-	//获取所有相关配置
-	cron := config.GetCronConfig()
-
-	//停止一段时间防止被识别为攻击
-	//time.Sleep(cron.Duration)
-	if config.CheckIfStatus() {
-		qiniuClient = qiniu.NewQiniuClient(cron.AccessKey, cron.SecretKey)
-
-		emailClient = email.NewEmailClient(cron.UserName, cron.Password, cron.Sender, cron.SmtpHost, cron.SmtpPort)
-
-		var err error
-		sslDAO, err = dao.NewSSLDao(cron.DB)
-		if err != nil {
-			log.Fatal("数据库配置失败!")
-			return
-		}
-
-		provider := ssl.NewProvider(ssl.Aliyun, cron.Aliyun.AccessKeyID, cron.Aliyun.AccessKeySecret, "")
-
-		cmClient, err = ssl.NewCertMagicClient(cron.Email, cron.SSLPath, provider)
-		if err != nil {
-			log.Fatal("certMagic配置失败!")
-			return
-		}
-
-		receiver = cron.Receiver
-		config.SetChangeStatus(false)
-
+	sslCredit, err := q.sslDAO.GetSSLByName(fatherDomain)
+	if err != nil {
+		return fmt.Errorf("从数据库获取证书失败:%w", err)
 	}
 
-	now = time.Now().Unix()
+	// 如果查询不到直接获取最新的
+	if sslCredit.ID == 0 {
+		sslCredit, err = q.getSSLCredit(ctx, fatherDomain, domains)
+		if err != nil {
+			return err
+		}
+	}
 
+	// 如果过期则先删除后获取
+	if !checkIfPass(now.Unix(), sslCredit.CreatedAt.Unix()) {
+		// 删除已经失效的证书
+		err = q.sslDAO.DeleteSSL(sslCredit.CertID)
+		if err != nil {
+			return fmt.Errorf("certID:%s ,删除证书失败:%w", sslCredit.CertID, err)
+		}
+		sslCredit, err = q.getSSLCredit(ctx, fatherDomain, domains)
+		if err != nil {
+			return err
+		}
+	}
+
+	// 从七牛云获取证书
+	resp, err := q.qiniuClient.GETSSLCertById(sslCredit.CertID)
+	if err != nil {
+		return fmt.Errorf("certID:%s ,从七牛云获取证书失败:%w", sslCredit.CertID, err)
+	}
+
+	// 如果七牛云已经失效则删除并重新获取
+	if !checkIfPass(now.Unix(), int64(resp.Cert.NotAfter)) {
+		// 删除已经失效的证书
+		err = q.sslDAO.DeleteSSL(sslCredit.CertID)
+		if err != nil {
+			return fmt.Errorf("certID:%s ,删除证书失败:%w", sslCredit.CertID, err)
+		}
+		sslCredit, err = q.getSSLCredit(ctx, fatherDomain, domains)
+		if err != nil {
+			return err
+		}
+	}
+
+	// 强制开启各个域名的HTTPS
+	for _, domain := range domains {
+		err := q.qiniuClient.ForceHTTPS(domain, sslCredit.CertID)
+		if err != nil {
+			return fmt.Errorf("domian:%s, certID:%s, 启用证书失败:%w", domain, sslCredit.CertID, err)
+		}
+
+		//防止被七牛云限流
+		time.Sleep(5 * time.Second)
+	}
+
+	return nil
 }
 
-const (
-	ExpirationThreshold = 25 // 证书过期阈值（天）,因为certMagic好像是剩余30天及以上才能续约
-	SecondsPerDay       = 24 * 60 * 60
-)
+func (q *QiniuSSL) getSSLCredit(ctx context.Context, fatherDomain string, domains []string) (*dao.SSL, error) {
+	var sslCredit *dao.SSL
+	// 尝试获取证书
+	certPEM, keyPEM, err := q.cmClient.ObtainCert(ctx, "*."+fatherDomain)
+	if err != nil {
+		return nil, fmt.Errorf("域名:%s ,获取证书失败:%w", "*."+fatherDomain, err)
+	}
+
+	// 上传证书
+	resp, err := q.qiniuClient.UPSSLCert(keyPEM, certPEM, fatherDomain)
+	if err != nil {
+		return nil, fmt.Errorf("keyPEM:%s ,certPEM:%s ,Domain:%s,上传证书失败:%w", keyPEM, certPEM, fatherDomain, err)
+	}
+
+	// 构建数据模型
+	sslCredit = &dao.SSL{
+		DomainName: fatherDomain,
+		CertID:     resp.CertID,
+		CertPEM:    certPEM,
+		KeyPEM:     keyPEM,
+	}
+	for _, domain := range domains {
+		sslCredit.Domains = append(sslCredit.Domains, dao.Domain{Name: domain})
+	}
+
+	// 写入数据库
+	err = q.sslDAO.CreateSSL(sslCredit)
+	if err != nil {
+		return nil, fmt.Errorf("certID:%s ,存储证书失败:%w", sslCredit.CertID, err)
+	}
+	return sslCredit, nil
+}
+
+func checkIfPass(now, t int64) bool {
+	return now-t < ExpirationThreshold*SecondsPerDay
+}
 
 // getDomainGroups 获取所有域名，并按父域名分组
 func (q *QiniuSSL) getDomainGroups() (map[string][]string, error) {
 	domainGroups := make(map[string][]string)
-	domainList, err := qiniuClient.GetDomainList()
+	domainList, err := q.qiniuClient.GetDomainList()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get domain list: %w", err)
 	}
@@ -141,7 +237,7 @@ func (q *QiniuSSL) getDomainGroups() (map[string][]string, error) {
 	// 从需要处理的表格中删除所有已经在符合条件的证书下的域名
 	for parentDomain, domains := range domainGroups {
 		// 获取已存储的域名及证书过期时间
-		certTime, storedDomains, err := sslDAO.GetDomains(parentDomain)
+		certTime, storedDomains, err := q.sslDAO.GetDomains(parentDomain)
 		switch err {
 		case nil:
 		case gorm.ErrRecordNotFound:
@@ -192,67 +288,4 @@ func getParentDomain(domain string) (string, error) {
 
 	// 组合剩余部分返回
 	return strings.Join(parts[1:], "."), nil
-}
-
-// 生成错误报告的html
-func (q *QiniuSSL) generateErrorReportHTML(errs []ErrWithDomain) string {
-	html := `
-		<!DOCTYPE html>
-		<html lang="zh">
-		<head>
-			<meta charset="UTF-8">
-			<meta name="viewport" content="width=device-width, initial-scale=1.0">
-			<title>失败域名报告</title>
-			<style>
-				body { font-family: Arial, sans-serif; margin: 20px; padding: 20px; }
-				.container { max-width: 600px; margin: auto; }
-				h2 { color: #d9534f; text-align: center; }
-				table { width: 100%%; border-collapse: collapse; margin-top: 20px; }
-				th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
-				th { background-color: #f8d7da; }
-				tr:nth-child(even) { background-color: #f2f2f2; }
-				.footer { margin-top: 20px; font-size: 14px; color: #777; text-align: center; }
-			</style>
-		</head>
-		<body>
-			<div class="container">
-				<h2>失败域名报告</h2>
-				<table>
-					<tr>
-						<th>域名列表</th>
-						<th>错误信息</th>
-					</tr>
-	`
-
-	for _, e := range errs {
-		html += fmt.Sprintf(`
-			<tr>
-				<td>%s</td>
-				<td>%s</td>
-			</tr>`, fmt.Sprintf("%v", e.Domains), e.err.Error())
-	}
-
-	html += `
-				</table>
-				<div class="footer">本邮件由系统自动发送，请勿回复。</div>
-			</div>
-		</body>
-		</html>
-	`
-
-	return html
-}
-
-type ErrWithDomain struct {
-	err     error
-	Domains []string
-}
-
-type DomainWithCert struct {
-	Domains      []string //域名列表
-	FatherDomain string   //父域名
-	OldCertId    string   //旧证书的id
-	CertId       string   //证书id
-	CertPEM      string   //证书的内容
-	KeyPEM       string   //证书的内容
 }

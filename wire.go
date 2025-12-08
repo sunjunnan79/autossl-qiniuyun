@@ -15,9 +15,10 @@ var wireSet = wire.NewSet(
 	NewApp,
 )
 
-func InitApp() *App {
+func InitApp() (*App, error) {
 	wire.Build(
 		wireSet,
 	)
-	return &App{}
+	return &App{}, nil
+
 }

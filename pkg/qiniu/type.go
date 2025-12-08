@@ -40,12 +40,32 @@ type GetSSLCertListReq struct {
 }
 
 type GetSSLCertByIDResp struct {
-	Name     string `json:"name"`
-	NotAfter int64  `json:"not_after"`
-	Pri      string `json:"pri"`
-	Ca       string `json:"ca"`
+	Code  int    `json:"code"`
+	Error string `json:"error"`
+	Cert  struct {
+		Certid           string   `json:"certid"`
+		Name             string   `json:"name"`
+		Uid              int      `json:"uid"`
+		CommonName       string   `json:"common_name"`
+		Dnsnames         []string `json:"dnsnames"`
+		CreateTime       int      `json:"create_time"`
+		NotBefore        int      `json:"not_before"`
+		NotAfter         int      `json:"not_after"`
+		Orderid          string   `json:"orderid"`
+		ProductShortName string   `json:"product_short_name"`
+		ProductType      string   `json:"product_type"`
+		CertType         string   `json:"cert_type"`
+		Encrypt          string   `json:"encrypt"`
+		EncryptParameter string   `json:"encryptParameter"`
+		Enable           bool     `json:"enable"`
+		ChildOrderId     string   `json:"child_order_id"`
+		State            string   `json:"state"`
+		AutoRenew        bool     `json:"auto_renew"`
+		Renewable        bool     `json:"renewable"`
+		Ca               string   `json:"ca"`
+		Pri              string   `json:"pri"`
+	} `json:"cert"`
 }
-
 type GetSSLCertListResp struct {
 	Certs []Cert `json:"certs"`
 }

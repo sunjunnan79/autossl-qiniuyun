@@ -14,6 +14,7 @@ const (
 	CloudFlare = "cloudflare"
 )
 
+// NewDNSProvider 虽然这里提供了三种但是实际上只用过aliyun的
 func NewDNSProvider(p Provider) (certmagic.DNSProvider, error) {
 	switch p.Platform {
 	case Aliyun:

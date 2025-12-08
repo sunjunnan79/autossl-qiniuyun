@@ -1,9 +1,11 @@
 package email
 
 import (
+	"crypto/tls"
 	"fmt"
 	"github.com/jordan-wright/email"
 	"net/smtp"
+	"net/textproto"
 )
 
 // EmailClient 结构体
@@ -12,7 +14,7 @@ type EmailClient struct {
 	SMTPPort string // SMTP 端口（25、465（SSL）、587（TLS））
 	SMTPUser string // 邮箱用户名
 	SMTPPass string // 邮箱密码
-	Sender   string // 发件人
+	Sender   string // 发件人昵称
 }
 
 // NewEmailClient 创建邮件客户端
@@ -33,37 +35,25 @@ func NewEmailClient(
 
 // SendEmail 发送邮件
 func (c *EmailClient) SendEmail(to []string, subject, text, html string, attachments []string) error {
-	e := email.NewEmail()
-
-	// 发件人
-	e.From = fmt.Sprintf("%s <%s>", c.Sender, c.SMTPUser)
-
-	// 收件人
-	e.To = to
-
-	// 主题
-	e.Subject = subject
-
-	// 纯文本内容
-	e.Text = []byte(text)
-
-	// HTML 内容
-	e.HTML = []byte(html)
-
-	// 添加附件
-	for _, filePath := range attachments {
-		if _, err := e.AttachFile(filePath); err != nil {
-			return fmt.Errorf("附件添加失败: %v", err)
+	e := &email.Email{
+		To:      to,
+		From:    fmt.Sprintf("%s <%s>", c.Sender, c.SMTPUser),
+		Subject: subject,
+		HTML:    []byte(html),
+		Headers: textproto.MIMEHeader{},
+		Text:    []byte(text),
+	}
+	for _, attachmentPath := range attachments {
+		// 如果文件不存在或无法读取，AttachFile 将返回错误
+		_, err := e.AttachFile(attachmentPath)
+		if err != nil {
+			// 注意：如果一个附件失败，通常应该返回错误并停止发送
+			return fmt.Errorf("failed to attach file %s: %w", attachmentPath, err)
 		}
 	}
-
-	// SMTP 认证
-	auth := smtp.PlainAuth("", c.SMTPUser, c.SMTPPass, c.SMTPHost)
-
-	// 发送邮件
-	err := e.Send(fmt.Sprintf("%s:%s", c.SMTPHost, c.SMTPPort), auth)
+	err := e.SendWithTLS(c.SMTPHost+":"+c.SMTPPort, smtp.PlainAuth("", c.SMTPUser, c.SMTPPass, c.SMTPHost), &tls.Config{ServerName: c.SMTPHost})
 	if err != nil {
-		return fmt.Errorf("邮件发送失败: %v", err)
+		return err
 	}
 
 	return nil

@@ -19,7 +19,7 @@ func NewSSLDao(path string) (*SSLDao, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return nil, fmt.Errorf("create db directory failed: %w", err)
 	}
-	
+
 	db, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect database: %w", err)
@@ -34,13 +34,7 @@ func NewSSLDao(path string) (*SSLDao, error) {
 }
 
 // CreateSSL 创建 SSL 证书记录
-func (dao *SSLDao) CreateSSL(domainName, certID, certPEM, keyPEM string, domains []string) error {
-	ssl := SSL{DomainName: domainName, CertID: certID, CertPEM: certPEM, KeyPEM: keyPEM}
-	// 将域名转换为 Domain 结构体
-	for _, domain := range domains {
-		ssl.Domains = append(ssl.Domains, Domain{Name: domain})
-	}
-
+func (dao *SSLDao) CreateSSL(ssl *SSL) error {
 	return dao.db.Create(&ssl).Error
 }
 
@@ -57,14 +51,13 @@ func (dao *SSLDao) GetSSLByID(certId string) (*SSL, error) {
 // GetSSLByID 通过 certId 获取 SSL 证书
 func (dao *SSLDao) GetSSLByName(name string) (*SSL, error) {
 	var ssl SSL
-	err := dao.db.Preload("Domains").Where("domain_name= ?", name).First(&ssl).Error
+	err := dao.db.Preload("Domains").Where("domain_name= ?", name).Find(&ssl).Error
 	if err != nil {
 		return nil, err
 	}
 	return &ssl, nil
 }
 
-// GetSSLByID 通过 certId 获取 SSL 证书
 func (dao *SSLDao) GetSSLS() (*[]SSL, error) {
 	var ssl []SSL
 	err := dao.db.Preload("Domains").Find(&ssl).Error

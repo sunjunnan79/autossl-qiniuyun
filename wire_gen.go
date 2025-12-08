@@ -13,11 +13,20 @@ import (
 
 // Injectors from wire.go:
 
-func InitApp() *App {
-	qiniuSSL := cron.NewQiniuSSL()
-	corn := cron.NewCorn(qiniuSSL)
-	app := NewApp(corn)
-	return app
+func InitApp() (*App, error) {
+	qiniuSSL, err := cron.NewQiniuSSL()
+	if err != nil {
+		return nil, err
+	}
+	corn, err := cron.NewCorn(qiniuSSL)
+	if err != nil {
+		return nil, err
+	}
+	app, err := NewApp(corn)
+	if err != nil {
+		return nil, err
+	}
+	return app, nil
 }
 
 // wire.go:

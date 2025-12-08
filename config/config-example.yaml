@@ -1,12 +1,10 @@
-# 配置文件支持热更新
-#用于发邮件做邮件报警
 email:
-  username: "your-email@xxx.com"
-  password: "password"
-  sender: "your-email@xxx.com"
-  receiver: "your-receiver-email@xxx.com"
-  smtpPort: "xxx"
-  smtpHost: "smtp.xxxx" #
+  username: "xxxx@xxxx.com"
+  password: ""
+  sender: "七牛云报警服务"
+  receiver: "xxxx@xxxx.com"
+  smtpPort: "465"
+  smtpHost: "smtp.exmail.qq.com" #
 
 qiniu:
   accessKey: ""
@@ -15,7 +13,7 @@ qiniu:
 ssl:
   duration: 300s # 5分钟一次
   sslPath : "./data/clientMagic"
-  email : "your-email@xxx.com"
+  email : "xxxx@xxxx.com"
   aliyun:
     accessKeyID: ""
     accessKeySecret: ""
