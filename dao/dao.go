@@ -91,7 +91,7 @@ func (dao *SSLDao) GetDomains(domainName string) (int64, []string, error) {
 		domainNames = append(domainNames, domain.Name)
 	}
 
-	return ssl.CreatedAt.Unix(), domainNames, nil
+	return ssl.NotAfter.Unix(), domainNames, nil
 }
 
 // UpdateSSL 更新 SSL 证书的域名

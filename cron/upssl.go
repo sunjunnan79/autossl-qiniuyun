@@ -2,6 +2,8 @@ package cron
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"github.com/muxi-Infra/autossl-qiniuyun/config"
 	"github.com/muxi-Infra/autossl-qiniuyun/dao"
@@ -134,7 +136,7 @@ func (q *QiniuSSL) StartStrategy(ctx context.Context, fatherDomain string, domai
 	}
 
 	// 如果过期则先删除后获取
-	if !checkIfPass(now.Unix(), sslCredit.CreatedAt.Unix()) {
+	if !checkIfPass(now.Unix(), sslCredit.NotAfter.Unix()) {
 		// 删除已经失效的证书
 		err = q.sslDAO.DeleteSSL(sslCredit.CertID)
 		if err != nil {
@@ -187,6 +189,17 @@ func (q *QiniuSSL) getSSLCredit(ctx context.Context, fatherDomain string, domain
 		return nil, fmt.Errorf("域名:%s ,获取证书失败:%w", "*."+fatherDomain, err)
 	}
 
+	// 解析证书并获取过期时间
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		return nil, fmt.Errorf("failed to parse certificate PEM")
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse certificate: %w", err)
+	}
+
 	// 上传证书
 	resp, err := q.qiniuClient.UPSSLCert(keyPEM, certPEM, fatherDomain)
 	if err != nil {
@@ -199,6 +212,7 @@ func (q *QiniuSSL) getSSLCredit(ctx context.Context, fatherDomain string, domain
 		CertID:     resp.CertID,
 		CertPEM:    certPEM,
 		KeyPEM:     keyPEM,
+		NotAfter:   cert.NotAfter,
 	}
 	for _, domain := range domains {
 		sslCredit.Domains = append(sslCredit.Domains, dao.Domain{Name: domain})
@@ -237,7 +251,7 @@ func (q *QiniuSSL) getDomainGroups() (map[string][]string, error) {
 	// 从需要处理的表格中删除所有已经在符合条件的证书下的域名
 	for parentDomain, domains := range domainGroups {
 		// 获取已存储的域名及证书过期时间
-		certTime, storedDomains, err := q.sslDAO.GetDomains(parentDomain)
+		notAfter, storedDomains, err := q.sslDAO.GetDomains(parentDomain)
 		switch err {
 		case nil:
 		case gorm.ErrRecordNotFound:
@@ -248,7 +262,7 @@ func (q *QiniuSSL) getDomainGroups() (map[string][]string, error) {
 
 		now := time.Now().Unix()
 		// 如果证书未过期，则去除已存储的域名
-		if now-certTime < ExpirationThreshold*SecondsPerDay {
+		if checkIfPass(now, notAfter) {
 			domainGroups[parentDomain] = filterUnstoredDomains(domains, storedDomains)
 		}
 	}
