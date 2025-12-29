@@ -1,0 +1,7 @@
+version: "3.7"
+services:
+  autossl-qiniuyun:
+    image: registry.cn-shenzhen.aliyuncs.com/muxiauth/autossl-qiniuyun:v1.0.0
+    environment:
+      NACOSDSN: "nacos.muxixyz.com:8848?namespace=public&username=nacos&password=muxistudio304&group=PROD&dataId=autossl-qiniuyun-prod"
+    restart: always

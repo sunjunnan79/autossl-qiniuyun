@@ -2,6 +2,7 @@ package dao
 
 import (
 	"gorm.io/gorm"
+	"time"
 )
 
 // SSL 证书表
@@ -11,6 +12,7 @@ type SSL struct {
 	CertID     string `gorm:"unique;not null"` // 证书 ID
 	CertPEM    string
 	KeyPEM     string
+	NotAfter   time.Time
 	Domains    []Domain `gorm:"foreignKey:SSLID"` // 关联 Domain
 }
 
