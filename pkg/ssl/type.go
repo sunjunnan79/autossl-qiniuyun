@@ -19,7 +19,6 @@ func (c *CertMagicClient) convertCertToPEM(cert tls.Certificate) (string, string
 			return "", "", fmt.Errorf("证书 PEM 编码失败: %v", err)
 		}
 	}
-
 	var keyPEM bytes.Buffer
 	switch key := cert.PrivateKey.(type) {
 	case *rsa.PrivateKey:

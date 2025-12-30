@@ -90,7 +90,7 @@ func (q *QiniuSSL) Start() {
 		}
 
 		for domain, list := range domainGroups {
-			err := q.StartStrategy(context.Background(), domain, list)
+			err := q.startStrategy(context.Background(), domain, list)
 			if err != nil {
 				// 发送邮件
 				err := q.emailClient.SendEmail([]string{q.receiver}, "七牛云自动报警服务", fmt.Sprintf("启动证书失败:%s", err.Error()), "", nil)
@@ -117,7 +117,7 @@ func (q *QiniuSSL) Start() {
 
 }
 
-func (q *QiniuSSL) StartStrategy(ctx context.Context, fatherDomain string, domains []string) error {
+func (q *QiniuSSL) startStrategy(ctx context.Context, fatherDomain string, domains []string) error {
 	var (
 		now = time.Now()
 	)
@@ -227,7 +227,8 @@ func (q *QiniuSSL) getSSLCredit(ctx context.Context, fatherDomain string, domain
 }
 
 func checkIfPass(now, t int64) bool {
-	return now-t < ExpirationThreshold*SecondsPerDay
+	// 目标时间与当前时间的差值大于指定时间
+	return t-now > ExpirationThreshold*SecondsPerDay
 }
 
 // getDomainGroups 获取所有域名，并按父域名分组
