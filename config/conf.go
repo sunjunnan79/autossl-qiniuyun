@@ -2,7 +2,7 @@ package config
 
 import (
 	"bytes"
-	"log"
+	"fmt"
 	"net/url"
 	"os"
 	"strconv"
@@ -29,15 +29,33 @@ type QiniuConf struct {
 	SecretKey string `yaml:"secretKey"`
 }
 
+type StoreConf struct {
+	Driver               string        `yaml:"driver"`
+	DSN                  string        `yaml:"dsn"`
+	CertMagicTablePrefix string        `yaml:"certmagicTablePrefix"`
+	LockLease            time.Duration `yaml:"lockLease"`
+}
+
+type CryptoConf struct {
+	MasterKey string `yaml:"masterKey"`
+}
+
+type MigrationConf struct {
+	LegacySQLitePath string `yaml:"legacySQLitePath"`
+}
+
 type SSLConf struct {
-	Email    string        `yaml:"email"`
-	Duration time.Duration `yaml:"duration"`
-	SSLPath  string        `yaml:"sslPath"`
-	Aliyun   struct {
+	Email     string        `yaml:"email"`
+	Duration  time.Duration `yaml:"duration"`
+	SSLPath   string        `yaml:"sslPath"`
+	DB        string        `yaml:"db"`
+	Store     StoreConf     `yaml:"store"`
+	Crypto    CryptoConf    `yaml:"crypto"`
+	Migration MigrationConf `yaml:"migration"`
+	Aliyun    struct {
 		AccessKeyID     string `yaml:"accessKeyID"`
 		AccessKeySecret string `yaml:"accessKeySecret"`
 	} `yaml:"aliyun"`
-	DB string `yaml:"db"`
 }
 
 type Conf struct {
@@ -46,51 +64,64 @@ type Conf struct {
 	Email EmailConf `yaml:"email"`
 }
 
-// 主入口：从 Nacos 拉取配置（一次性）
+const (
+	defaultLocalConfigPath      = "./config/config.yaml"
+	defaultSyncInterval         = 5 * time.Minute
+	defaultDistributedLockLease = 15 * time.Minute
+	defaultCertMagicNamespace   = "autossl-qiniu"
+)
+
 func GetConfig() (*Conf, error) {
-
-	//从nacos获取
-	content, err := getConfigFromNacos()
+	content, err := getConfigContent()
 	if err != nil {
-		log.Println(err)
-
-		localPath := "./config/config.yaml"
-		fileContent, err := os.ReadFile(localPath)
-		if err != nil {
-			// 如果本地文件也读取失败，则彻底失败
-			log.Fatalf("无法读取本地配置文件 %s，且 Nacos 配置获取失败: %v", localPath, err)
-			return nil, err
-		}
-		content = string(fileContent)
+		return nil, err
 	}
 
 	v := viper.New()
 	v.SetConfigType("yaml")
 
 	if err := v.ReadConfig(bytes.NewBufferString(content)); err != nil {
-		log.Fatal("配置解析失败:", err)
-		return nil, err
+		return nil, fmt.Errorf("parse config failed: %w", err)
 	}
 
 	var conf Conf
-	err = v.Unmarshal(&conf)
-	if err != nil {
-		log.Fatal(err)
+	if err := v.Unmarshal(&conf); err != nil {
+		return nil, fmt.Errorf("decode config failed: %w", err)
+	}
+
+	if err := validateConfig(&conf); err != nil {
 		return nil, err
 	}
 
 	return &conf, nil
 }
-func getConfigFromNacos() (string, error) {
-	server, port, namespace, user, pass, group, dataId := parseNacosDSN()
 
-	serverConfigs := []constant.ServerConfig{
-		{
-			IpAddr: server,
-			Port:   port,
-			Scheme: "http",
-		},
+func getConfigContent() (string, error) {
+	if dsn := os.Getenv("NACOSDSN"); dsn != "" {
+		content, err := getConfigFromNacos(dsn)
+		if err == nil {
+			return content, nil
+		}
 	}
+
+	fileContent, err := os.ReadFile(defaultLocalConfigPath)
+	if err != nil {
+		return "", fmt.Errorf("read local config %s failed: %w", defaultLocalConfigPath, err)
+	}
+	return string(fileContent), nil
+}
+
+func getConfigFromNacos(dsn string) (string, error) {
+	server, port, namespace, user, pass, group, dataID, err := parseNacosDSN(dsn)
+	if err != nil {
+		return "", err
+	}
+
+	serverConfigs := []constant.ServerConfig{{
+		IpAddr: server,
+		Port:   port,
+		Scheme: "http",
+	}}
 
 	clientConfig := constant.ClientConfig{
 		NamespaceId:         namespace,
@@ -106,38 +137,41 @@ func getConfigFromNacos() (string, error) {
 		"clientConfig":  clientConfig,
 	})
 	if err != nil {
-		log.Fatal("初始化失败:", err)
+		return "", fmt.Errorf("init nacos config client failed: %w", err)
 	}
 
 	content, err := configClient.GetConfig(vo.ConfigParam{
-		DataId: dataId,
+		DataId: dataID,
 		Group:  group,
 	})
 	if err != nil {
-		log.Fatal("拉取配置失败:", err)
+		return "", fmt.Errorf("get nacos config failed: %w", err)
 	}
 	return content, nil
 }
 
-// DSN 示例： localhost:8848?namespace=default&username=nacos&password=1234&group=QA&dataId=my-service
-func parseNacosDSN() (server string, port uint64, ns, user, pass, group, dataId string) {
-	dsn := os.Getenv("NACOSDSN")
+func parseNacosDSN(dsn string) (server string, port uint64, ns, user, pass, group, dataID string, err error) {
 	if dsn == "" {
-		log.Fatal("环境变量 NACOSDSN 未设置")
+		return "", 0, "", "", "", "", "", fmt.Errorf("environment variable NACOSDSN is empty")
 	}
 
 	parts := strings.SplitN(dsn, "?", 2)
 	host := parts[0]
 	params := url.Values{}
-
 	if len(parts) == 2 {
 		params, _ = url.ParseQuery(parts[1])
 	}
 
 	hostParts := strings.Split(host, ":")
 	server = hostParts[0]
+	if server == "" {
+		return "", 0, "", "", "", "", "", fmt.Errorf("invalid nacos host in DSN")
+	}
 	if len(hostParts) > 1 {
-		p, _ := strconv.Atoi(hostParts[1])
+		p, convErr := strconv.Atoi(hostParts[1])
+		if convErr != nil {
+			return "", 0, "", "", "", "", "", fmt.Errorf("invalid nacos port: %w", convErr)
+		}
 		port = uint64(p)
 	} else {
 		port = 8848
@@ -151,6 +185,53 @@ func parseNacosDSN() (server string, port uint64, ns, user, pass, group, dataId 
 	user = params.Get("username")
 	pass = params.Get("password")
 	group = params.Get("group")
-	dataId = params.Get("dataId")
+	if group == "" {
+		group = "DEFAULT_GROUP"
+	}
+
+	dataID = params.Get("dataId")
+	if dataID == "" {
+		return "", 0, "", "", "", "", "", fmt.Errorf("dataId is required in NACOSDSN")
+	}
+
 	return
+}
+
+func validateConfig(conf *Conf) error {
+	switch {
+	case conf.Qiniu.AccessKey == "":
+		return fmt.Errorf("qiniu accessKey is required")
+	case conf.Qiniu.SecretKey == "":
+		return fmt.Errorf("qiniu secretKey is required")
+	case conf.SSL.Email == "":
+		return fmt.Errorf("ssl email is required")
+	case conf.SSL.Crypto.MasterKey == "":
+		return fmt.Errorf("ssl crypto masterKey is required")
+	}
+
+	if conf.SSL.Duration <= 0 {
+		conf.SSL.Duration = defaultSyncInterval
+	}
+
+	if conf.SSL.Store.Driver == "" && conf.SSL.DB != "" {
+		conf.SSL.Store.Driver = "sqlite"
+	}
+	if conf.SSL.Store.DSN == "" && conf.SSL.DB != "" {
+		conf.SSL.Store.DSN = conf.SSL.DB
+	}
+
+	if conf.SSL.Store.Driver == "" {
+		return fmt.Errorf("ssl store driver is required")
+	}
+	if conf.SSL.Store.DSN == "" {
+		return fmt.Errorf("ssl store dsn is required")
+	}
+	if conf.SSL.Store.CertMagicTablePrefix == "" {
+		conf.SSL.Store.CertMagicTablePrefix = defaultCertMagicNamespace
+	}
+	if conf.SSL.Store.LockLease <= 0 {
+		conf.SSL.Store.LockLease = defaultDistributedLockLease
+	}
+
+	return nil
 }

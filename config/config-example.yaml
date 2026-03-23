@@ -1,22 +1,27 @@
 email:
-  username: "xxxx@xxxx.com"
+  username: "ops@example.com"
   password: ""
-  sender: "七牛云报警服务"
-  receiver: "xxxx@xxxx.com"
+  sender: "autossl-qiniu"
+  receiver: "ops@example.com"
   smtpPort: "465"
-  smtpHost: "smtp.exmail.qq.com" #
+  smtpHost: "smtp.exmail.qq.com"
 
 qiniu:
   accessKey: ""
   secretKey: ""
 
 ssl:
-  duration: 300s # 5分钟一次
-  sslPath : "./data/clientMagic"
-  email : "xxxx@xxxx.com"
+  duration: 300s
+  email: "ops@example.com"
   aliyun:
     accessKeyID: ""
     accessKeySecret: ""
-  db : "./data/sqlite/ssl.db"
-
-
+  store:
+    driver: "mysql"
+    dsn: "user:password@tcp(127.0.0.1:3306)/autossl?charset=utf8mb4&parseTime=True&loc=Local"
+    certmagicTablePrefix: "autossl-qiniu"
+    lockLease: 15m
+  crypto:
+    masterKey: "replace-with-a-strong-secret"
+  migration:
+    legacySQLitePath: ""

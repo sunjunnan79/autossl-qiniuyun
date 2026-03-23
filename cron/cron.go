@@ -1,7 +1,9 @@
 package cron
 
+import "context"
+
 type Corn interface {
-	Start()
+	Start(ctx context.Context) error
 }
 
 func NewCorn(q *QiniuSSL) (Corn, error) {

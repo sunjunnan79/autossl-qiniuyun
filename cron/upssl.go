@@ -2,25 +2,32 @@ package cron
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log"
+	"os"
+	"runtime/debug"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/muxi-Infra/autossl-qiniuyun/config"
 	"github.com/muxi-Infra/autossl-qiniuyun/dao"
+	appcrypto "github.com/muxi-Infra/autossl-qiniuyun/pkg/crypto"
 	"github.com/muxi-Infra/autossl-qiniuyun/pkg/email"
 	"github.com/muxi-Infra/autossl-qiniuyun/pkg/qiniu"
 	"github.com/muxi-Infra/autossl-qiniuyun/pkg/ssl"
-	"github.com/samber/lo"
-	"gorm.io/gorm"
 )
 
 const (
-	ExpirationThreshold = 20 // 证书过期阈值（天）,因为certMagic好像是剩余30天及以上才能续约
+	ExpirationThreshold = 20
 	SecondsPerDay       = 24 * 60 * 60
+	DefaultInterval     = 5 * time.Minute
+	DefaultRunTimeout   = 5 * time.Minute
 )
 
 type QiniuSSL struct {
@@ -30,31 +37,41 @@ type QiniuSSL struct {
 	emailClient *email.EmailClient
 	receiver    string
 	duration    time.Duration
+	lockLease   time.Duration
+	instanceID  string
 }
 
 func NewQiniuSSL() (*QiniuSSL, error) {
-	//获取所有相关配置
 	conf, err := config.GetConfig()
 	if err != nil {
 		return nil, err
 	}
-	qiniuClient := qiniu.NewQiniuClient(
-		conf.Qiniu.AccessKey,
-		conf.Qiniu.SecretKey,
-	)
 
-	emailClient := email.NewEmailClient(
-		conf.Email.UserName,
-		conf.Email.Password,
-		conf.Email.Sender,
-		conf.Email.SmtpHost,
-		conf.Email.SmtpPort,
-	)
-
-	sslDAO, err := dao.NewSSLDao(conf.SSL.DB)
+	encryptor, err := appcrypto.NewEncryptor(conf.SSL.Crypto.MasterKey)
 	if err != nil {
 		return nil, err
 	}
+
+	sslDAO, err := dao.NewSSLDao(conf.SSL.Store.Driver, conf.SSL.Store.DSN, encryptor)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := sslDAO.ImportLegacySQLite(context.Background(), conf.SSL.Migration.LegacySQLitePath); err != nil {
+		return nil, err
+	}
+
+	instanceID, err := buildInstanceID()
+	if err != nil {
+		return nil, err
+	}
+
+	storage := ssl.NewDatabaseStorage(
+		sslDAO,
+		conf.SSL.Store.CertMagicTablePrefix,
+		instanceID,
+		conf.SSL.Store.LockLease,
+	)
 
 	provider := ssl.NewProvider(
 		ssl.Aliyun,
@@ -63,181 +80,305 @@ func NewQiniuSSL() (*QiniuSSL, error) {
 		"",
 	)
 
-	cmClient, err := ssl.NewCertMagicClient(conf.SSL.Email, conf.SSL.SSLPath, provider)
+	cmClient, err := ssl.NewCertMagicClient(conf.SSL.Email, storage, provider)
 	if err != nil {
 		return nil, err
 	}
 
 	return &QiniuSSL{
-		qiniuClient: qiniuClient,
-		emailClient: emailClient,
+		qiniuClient: qiniu.NewQiniuClient(conf.Qiniu.AccessKey, conf.Qiniu.SecretKey),
 		sslDAO:      sslDAO,
 		cmClient:    cmClient,
-		receiver:    conf.Email.Receiver,
-		duration:    conf.SSL.Duration,
+		emailClient: email.NewEmailClient(
+			conf.Email.UserName,
+			conf.Email.Password,
+			conf.Email.Sender,
+			conf.Email.SmtpHost,
+			conf.Email.SmtpPort,
+		),
+		receiver:   conf.Email.Receiver,
+		duration:   conf.SSL.Duration,
+		lockLease:  conf.SSL.Store.LockLease,
+		instanceID: instanceID,
 	}, nil
 }
 
-func (q *QiniuSSL) Start() {
-	run := func() error {
-		//按照父域名对域名进行分组
-		domainGroups, err := q.getDomainGroups()
-		if err != nil {
-			//发送邮件
-			err := q.emailClient.SendEmail([]string{q.receiver}, "七牛云自动报警服务", fmt.Sprintf("域名列表分组失败!:%s", err.Error()), "", nil)
-			if err != nil {
-				log.Println(err)
-				return err
-			}
-		}
+func (q *QiniuSSL) Start(ctx context.Context) error {
+	interval := q.duration
+	if interval <= 0 {
+		interval = DefaultInterval
+	}
+	defer func() {
+		_ = q.sslDAO.Close()
+	}()
 
-		for domain, list := range domainGroups {
-			err := q.startStrategy(context.Background(), domain, list)
-			if err != nil {
-				// 发送邮件
-				err := q.emailClient.SendEmail([]string{q.receiver}, "七牛云自动报警服务", fmt.Sprintf("启动证书失败:%s", err.Error()), "", nil)
-				if err != nil {
-					log.Println(err)
-				}
-				continue
-			}
-		}
-		return nil
+	if err := q.runOnce(ctx); err != nil {
+		log.Println(err)
 	}
 
-	//首次启动进行的操作
-	//强制为所有的域名申请证书
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
 	for {
-
-		if err := run(); err != nil {
-			log.Println(err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if err := q.runOnce(ctx); err != nil {
+				log.Println(err)
+			}
 		}
-
-		// 停五分钟等待
-		time.Sleep(5 * time.Minute)
 	}
-
 }
 
-func (q *QiniuSSL) startStrategy(ctx context.Context, fatherDomain string, domains []string) error {
-	var (
-		now = time.Now()
-	)
+func (q *QiniuSSL) runOnce(ctx context.Context) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic in SSL sync: %v\n%s", r, string(debug.Stack()))
+			log.Println(err)
+			q.notifyError("autossl-qiniu alert", fmt.Sprintf("ssl sync panic: %v", r))
+		}
+	}()
 
-	sslCredit, err := q.sslDAO.GetSSLByName(fatherDomain)
+	runCtx, cancel := context.WithTimeout(ctx, DefaultRunTimeout)
+	defer cancel()
+
+	domainGroups, err := q.getDomainGroups()
 	if err != nil {
-		return fmt.Errorf("从数据库获取证书失败:%w", err)
+		q.notifyError("autossl-qiniu alert", fmt.Sprintf("group domains failed: %s", err.Error()))
+		return err
 	}
 
-	// 如果查询不到直接获取最新的
-	if sslCredit.ID == 0 {
-		sslCredit, err = q.obtainSSLCredit(ctx, fatherDomain)
+	for parentDomain, domains := range domainGroups {
+		lockToken := fmt.Sprintf("%s:%s:%d", q.instanceID, parentDomain, time.Now().UnixNano())
+		ok, err := q.sslDAO.TryAcquireLock(runCtx, "sync:"+parentDomain, lockToken, q.instanceID, q.lockLease)
 		if err != nil {
-			return err
+			log.Println(err)
+			continue
 		}
-	}
-
-	// 如果过期则先删除后获取
-	if !checkIfPass(now.Unix(), sslCredit.NotAfter.Unix()) {
-		// 删除已经失效的证书
-		err = q.sslDAO.DeleteSSL(sslCredit.CertID)
-		if err != nil {
-			return fmt.Errorf("certID:%s ,删除证书失败:%w", sslCredit.CertID, err)
+		if !ok {
+			continue
 		}
-		sslCredit, err = q.obtainSSLCredit(ctx, fatherDomain)
-		if err != nil {
-			return err
-		}
-	}
 
-	// 从七牛云获取证书
-	resp, err := q.qiniuClient.GETSSLCertById(sslCredit.CertID)
-	if err != nil {
-		return fmt.Errorf("certID:%s ,从七牛云获取证书失败:%w", sslCredit.CertID, err)
-	}
+		func() {
+			defer func() {
+				if err := q.sslDAO.ReleaseLock(context.Background(), "sync:"+parentDomain, lockToken); err != nil {
+					log.Println(err)
+				}
+			}()
 
-	// 如果七牛云已经失效则删除并重新获取
-	if !checkIfPass(now.Unix(), int64(resp.Cert.NotAfter)) {
-		// 删除已经失效的证书
-		err = q.sslDAO.DeleteSSL(sslCredit.CertID)
-		if err != nil {
-			return fmt.Errorf("certID:%s ,删除证书失败:%w", sslCredit.CertID, err)
-		}
-		sslCredit, err = q.obtainSSLCredit(ctx, fatherDomain)
-		if err != nil {
-			return err
-		}
-	}
-
-	var successDomains []dao.Domain
-	// 强制开启各个域名的HTTPS
-	for _, domain := range domains {
-		err := q.qiniuClient.ForceHTTPS(domain, sslCredit.CertID)
-		if err != nil {
-			return fmt.Errorf("domain:%s, certID:%s, 启用证书失败:%w", domain, sslCredit.CertID, err)
-		}
-		successDomains = append(successDomains, dao.Domain{Name: domain})
-
-		//防止被七牛云限流
-		time.Sleep(5 * time.Second)
-	}
-
-	// 获取去重后的结果并保存
-	sslCredit.Domains = lo.UniqBy(append(sslCredit.Domains, successDomains...), func(d dao.Domain) string {
-		return d.Name
-	})
-
-	err = q.sslDAO.SaveSSL(sslCredit)
-	if err != nil {
-		return fmt.Errorf("domain:%s, certID:%s, 保存或更新证书失败:%w", sslCredit.DomainName, sslCredit.CertID, err)
+			if err := q.syncParentDomain(runCtx, parentDomain, domains); err != nil {
+				log.Println(err)
+				q.notifyError("autossl-qiniu alert", fmt.Sprintf("sync certificate for %s failed: %s", parentDomain, err.Error()))
+			}
+		}()
 	}
 
 	return nil
 }
 
-func (q *QiniuSSL) obtainSSLCredit(ctx context.Context, fatherDomain string) (*dao.SSL, error) {
-	var sslCredit *dao.SSL
-	// 尝试获取证书
-	certPEM, keyPEM, err := q.cmClient.ObtainCert(ctx, "*."+fatherDomain)
-	if err != nil {
-		return nil, fmt.Errorf("域名:%s ,获取证书失败:%w", "*."+fatherDomain, err)
+func (q *QiniuSSL) syncParentDomain(ctx context.Context, parentDomain string, domains []string) error {
+	if len(domains) == 0 {
+		return nil
 	}
 
-	// 解析证书并获取过期时间
+	sort.Strings(domains)
+	activeCert, err := q.sslDAO.GetActiveCertificate(ctx, parentDomain)
+	if err != nil {
+		return fmt.Errorf("get active certificate failed: %w", err)
+	}
+
+	pendingCert, err := q.sslDAO.GetLatestPendingCertificate(ctx, parentDomain)
+	if err != nil {
+		return fmt.Errorf("get pending certificate failed: %w", err)
+	}
+
+	if pendingCert != nil && checkIfPass(time.Now().Unix(), pendingCert.NotAfter.Unix()) {
+		return q.ensurePublished(ctx, pendingCert, domains, true)
+	}
+
+	if activeCert == nil {
+		return q.obtainAndPublish(ctx, parentDomain, domains)
+	}
+
+	if !checkIfPass(time.Now().Unix(), activeCert.NotAfter.Unix()) {
+		return q.obtainAndPublish(ctx, parentDomain, domains)
+	}
+
+	if !q.qiniuCertUsable(ctx, activeCert.PublishedCertID) {
+		return q.ensurePublished(ctx, activeCert, domains, false)
+	}
+
+	pendingDomains := filterUnpublishedDomains(domains, activeCert.Domains)
+	if len(pendingDomains) > 0 {
+		return q.ensurePublished(ctx, activeCert, pendingDomains, false)
+	}
+
+	return nil
+}
+
+func (q *QiniuSSL) obtainAndPublish(ctx context.Context, parentDomain string, domains []string) error {
+	certPEM, keyPEM, notAfter, fingerprint, err := q.obtainSSLCredit(ctx, parentDomain)
+	if err != nil {
+		return err
+	}
+
+	candidate, err := q.sslDAO.CreatePendingCertificate(ctx, parentDomain, fingerprint, certPEM, keyPEM, notAfter)
+	if err != nil {
+		return fmt.Errorf("create pending certificate failed: %w", err)
+	}
+
+	return q.ensurePublished(ctx, candidate, domains, true)
+}
+
+func (q *QiniuSSL) ensurePublished(ctx context.Context, cert *dao.CertificateData, domains []string, activate bool) error {
+	publishedCertID := cert.PublishedCertID
+	if !q.qiniuCertUsable(ctx, publishedCertID) {
+		resp, err := q.qiniuClient.UPSSLCert(cert.KeyPEM, cert.CertPEM, cert.ParentDomain)
+		if err != nil {
+			_ = q.sslDAO.MarkCertificatePublishFailed(ctx, cert.ID, publishedCertID, err.Error(), domains, nil, nil, nil)
+			return fmt.Errorf("upload certificate to qiniu failed: %w", err)
+		}
+		publishedCertID = resp.CertID
+		if err := q.sslDAO.MarkCertificateUploaded(ctx, cert.ID, publishedCertID); err != nil {
+			return fmt.Errorf("persist qiniu cert id failed: %w", err)
+		}
+	}
+
+	var (
+		successDomains []string
+		skippedDomains []dao.SkippedDomain
+		failedDomains  []dao.FailedDomain
+	)
+
+	for _, domain := range domains {
+		if err := q.qiniuClient.ForceHTTPS(domain, publishedCertID); err != nil {
+			var reqErr *qiniu.RequestError
+			if errors.As(err, &reqErr) && reqErr.IsMissingCNAME() {
+				skippedDomains = append(skippedDomains, dao.SkippedDomain{
+					Domain: domain,
+					Reason: "missing_cname",
+					Error:  err.Error(),
+				})
+				continue
+			}
+			failedDomains = append(failedDomains, dao.FailedDomain{
+				Domain: domain,
+				Error:  err.Error(),
+			})
+			continue
+		}
+		successDomains = append(successDomains, domain)
+	}
+
+	if len(successDomains) == 0 {
+		if len(failedDomains) > 0 {
+			_ = q.sslDAO.MarkCertificatePublishFailed(ctx, cert.ID, publishedCertID, "no domains published successfully", domains, nil, skippedDomains, failedDomains)
+			return fmt.Errorf("failed to publish domains for %s: failed=%+v skipped=%+v", cert.ParentDomain, failedDomains, skippedDomains)
+		}
+		if len(skippedDomains) > 0 {
+			if err := q.sslDAO.RecordCertificatePublishSkipped(ctx, cert.ID, publishedCertID, domains, skippedDomains, nil); err != nil {
+				return fmt.Errorf("record skipped publish failed: %w", err)
+			}
+		}
+		log.Printf("skip publishing certificate for %s because all domains are missing cname: %+v", cert.ParentDomain, skippedDomains)
+		return nil
+	}
+
+	if activate {
+		if err := q.sslDAO.ActivateCertificate(ctx, cert.ID, successDomains, publishedCertID, time.Now().UTC(), skippedDomains, failedDomains); err != nil {
+			return fmt.Errorf("activate certificate failed: %w", err)
+		}
+	} else {
+		allSuccessfulDomains := uniqueSortedDomains(append(append([]string{}, cert.Domains...), successDomains...))
+		if err := q.sslDAO.RefreshActiveCertificateState(ctx, cert.ID, allSuccessfulDomains, publishedCertID, time.Now().UTC(), skippedDomains, failedDomains); err != nil {
+			return fmt.Errorf("refresh active certificate state failed: %w", err)
+		}
+	}
+
+	if len(skippedDomains) > 0 {
+		log.Printf("published certificate for %s with skipped domains: %+v", cert.ParentDomain, skippedDomains)
+	}
+	if len(failedDomains) > 0 {
+		return fmt.Errorf("published certificate for %s with failed domains: %+v", cert.ParentDomain, failedDomains)
+	}
+
+	if len(skippedDomains) > 0 {
+		return nil
+	}
+
+	return nil
+}
+
+func filterUnpublishedDomains(allDomains, publishedDomains []string) []string {
+	if len(allDomains) == 0 {
+		return nil
+	}
+
+	publishedSet := make(map[string]struct{}, len(publishedDomains))
+	for _, domain := range publishedDomains {
+		publishedSet[domain] = struct{}{}
+	}
+
+	var pending []string
+	for _, domain := range allDomains {
+		if _, exists := publishedSet[domain]; exists {
+			continue
+		}
+		pending = append(pending, domain)
+	}
+	return uniqueSortedDomains(pending)
+}
+
+func (q *QiniuSSL) obtainSSLCredit(ctx context.Context, fatherDomain string) (certPEM, keyPEM string, notAfter time.Time, fingerprint string, err error) {
+	certPEM, keyPEM, err = q.cmClient.ObtainCert(ctx, "*."+fatherDomain)
+	if err != nil {
+		return "", "", time.Time{}, "", fmt.Errorf("obtain certificate for %s failed: %w", "*."+fatherDomain, err)
+	}
+
 	block, _ := pem.Decode([]byte(certPEM))
 	if block == nil {
-		return nil, fmt.Errorf("failed to parse certificate PEM")
+		return "", "", time.Time{}, "", fmt.Errorf("failed to parse certificate PEM")
 	}
 
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse certificate: %w", err)
+		return "", "", time.Time{}, "", fmt.Errorf("failed to parse certificate: %w", err)
 	}
 
-	// 上传证书
-	resp, err := q.qiniuClient.UPSSLCert(keyPEM, certPEM, fatherDomain)
+	sum := sha256.Sum256(block.Bytes)
+	return certPEM, keyPEM, cert.NotAfter.UTC(), hex.EncodeToString(sum[:]), nil
+}
+
+func (q *QiniuSSL) qiniuCertUsable(ctx context.Context, certID string) bool {
+	if certID == "" {
+		return false
+	}
+
+	resp, err := q.qiniuClient.GETSSLCertById(certID)
 	if err != nil {
-		return nil, fmt.Errorf("keyPEM:%s ,certPEM:%s ,Domain:%s,上传证书失败:%w", keyPEM, certPEM, fatherDomain, err)
+		return false
+	}
+	if resp.Code != 0 && resp.Cert.Certid == "" {
+		return false
+	}
+	return checkIfPass(time.Now().Unix(), int64(resp.Cert.NotAfter))
+}
+
+func (q *QiniuSSL) notifyError(subject, text string) {
+	if q.emailClient == nil || q.receiver == "" {
+		return
 	}
 
-	// 构建数据模型,注意此时是没有存入任何的子域名的
-	sslCredit = &dao.SSL{
-		DomainName: fatherDomain,
-		CertID:     resp.CertID,
-		CertPEM:    certPEM,
-		KeyPEM:     keyPEM,
-		NotAfter:   cert.NotAfter,
+	if err := q.emailClient.SendEmail([]string{q.receiver}, subject, text, "", nil); err != nil {
+		log.Println(err)
 	}
-
-	return sslCredit, nil
 }
 
 func checkIfPass(now, t int64) bool {
-	// 目标时间与当前时间的差值大于指定时间
 	return t-now > ExpirationThreshold*SecondsPerDay
 }
 
-// getDomainGroups 获取所有域名，并按父域名分组
 func (q *QiniuSSL) getDomainGroups() (map[string][]string, error) {
 	domainGroups := make(map[string][]string)
 	domainList, err := q.qiniuClient.GetDomainList()
@@ -245,68 +386,67 @@ func (q *QiniuSSL) getDomainGroups() (map[string][]string, error) {
 		return nil, fmt.Errorf("failed to get domain list: %w", err)
 	}
 
-	// 按父域名分组
 	for _, domain := range domainList.Domains {
 		parentDomain, err := getParentDomain(domain.Name)
 		if err != nil {
-			fmt.Printf("无法解析域名 %s: %v\n", domain.Name, err)
+			log.Printf("parse domain %s failed: %v", domain.Name, err)
 			continue
 		}
 		domainGroups[parentDomain] = append(domainGroups[parentDomain], domain.Name)
 	}
 
-	// 从需要处理的表格中删除所有已经在符合条件的证书下的域名
 	for parentDomain, domains := range domainGroups {
-		// 获取已存储的域名及证书过期时间
-		notAfter, storedDomains, err := q.sslDAO.GetDomains(parentDomain)
-		switch err {
-		case nil:
-		case gorm.ErrRecordNotFound:
-			continue
-		default:
-			return nil, err
-		}
-
-		now := time.Now().Unix()
-		// 如果证书未过期，则去除已存储的域名
-		if checkIfPass(now, notAfter) {
-			domainGroups[parentDomain] = filterUnstoredDomains(domains, storedDomains)
-		}
+		domainGroups[parentDomain] = uniqueSortedDomains(domains)
 	}
 
 	return domainGroups, nil
 }
 
-// filterUnstoredDomains 过滤掉已经存储的域名
-func filterUnstoredDomains(allDomains, storedDomains []string) []string {
-	storedMap := make(map[string]struct{})
-	for _, d := range storedDomains {
-		storedMap[d] = struct{}{}
+func needsRepublish(active *dao.CertificateData, domains []string) bool {
+	if active == nil {
+		return true
 	}
-
-	var result []string
-	for _, d := range allDomains {
-		if _, exists := storedMap[d]; !exists {
-			result = append(result, d)
+	if len(active.Domains) != len(domains) {
+		return true
+	}
+	for index := range domains {
+		if active.Domains[index] != domains[index] {
+			return true
 		}
 	}
+	return false
+}
+
+func uniqueSortedDomains(domains []string) []string {
+	set := make(map[string]struct{}, len(domains))
+	for _, domain := range domains {
+		set[domain] = struct{}{}
+	}
+	result := make([]string, 0, len(set))
+	for domain := range set {
+		result = append(result, domain)
+	}
+	sort.Strings(result)
 	return result
 }
 
 func getParentDomain(domain string) (string, error) {
-
-	//如果是以.开头的话直接返回,表示是为了某个泛用域名做申请
 	if strings.HasPrefix(domain, ".") {
 		return strings.TrimPrefix(domain, "."), nil
 	}
 
-	// 拆分域名
 	parts := strings.Split(domain, ".")
-	// 如果域名部分少于两段，说明已经是顶级域名了
 	if len(parts) < 2 {
 		return "", fmt.Errorf("no parent domain for %s", domain)
 	}
 
-	// 组合剩余部分返回
 	return strings.Join(parts[1:], "."), nil
+}
+
+func buildInstanceID() (string, error) {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s-%d", hostname, os.Getpid()), nil
 }

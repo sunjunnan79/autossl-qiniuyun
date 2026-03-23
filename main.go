@@ -1,8 +1,12 @@
 package main
 
 import (
-	"github.com/muxi-Infra/autossl-qiniuyun/cron"
+	"context"
 	"log"
+	"os/signal"
+	"syscall"
+
+	"github.com/muxi-Infra/autossl-qiniuyun/cron"
 )
 
 func main() {
@@ -11,8 +15,13 @@ func main() {
 		log.Println(err)
 		return
 	}
-	app.Serve()
-	return
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if err := app.Serve(ctx); err != nil {
+		log.Println(err)
+	}
 }
 
 type App struct {
@@ -25,6 +34,6 @@ func NewApp(cron cron.Corn) (*App, error) {
 	}, nil
 }
 
-func (app *App) Serve() {
-	app.corn.Start()
+func (app *App) Serve(ctx context.Context) error {
+	return app.corn.Start(ctx)
 }
